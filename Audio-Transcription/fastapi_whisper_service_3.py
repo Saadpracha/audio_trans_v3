@@ -551,9 +551,15 @@ def send_make_webhook_v3(job_data: dict, contact_id: Optional[str], call_id: Opt
         # Start with original payload (what Make.com sent us) to echo data back
         payload: Dict[str, Any] = dict(original_payload or {})
 
-        # V3: Remove date_time and company_name (top-level)
-        payload.pop("date_time", None)
-        payload.pop("company_name", None)
+        # Ensure key custom fields are surfaced at top level even if only present in customData
+        try:
+            custom = original_payload.get("customData") if isinstance(original_payload, dict) else None
+        except Exception:
+            custom = None
+        if isinstance(custom, dict):
+            for field in ("audio", "token", "slug", "googlesheet"):
+                if field not in payload and custom.get(field) is not None:
+                    payload[field] = custom.get(field)
 
         # Add/override our fields
         payload.update({
