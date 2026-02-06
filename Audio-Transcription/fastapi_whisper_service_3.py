@@ -557,7 +557,7 @@ def send_make_webhook_v3(job_data: dict, contact_id: Optional[str], call_id: Opt
         except Exception:
             custom = None
         if isinstance(custom, dict):
-            for field in ("audio", "token", "slug", "googlesheet"):
+            for field in ("audio", "token", "slug", "googlesheet", "transcribe"):
                 if field not in payload and custom.get(field) is not None:
                     payload[field] = custom.get(field)
 
@@ -1076,9 +1076,14 @@ def process_job(job_id: str, payload: dict):
         logger.info("Job %s payload type: %s", job_id, type(payload))
         logger.info("Job %s payload audio value: %s", job_id, payload.get("audio") if isinstance(payload, dict) else "N/A")
         
-        audio_url = payload.get("audio")
-        if not audio_url:
-            raise ValueError("payload must include 'audio' url")
+        # Normalize transcribe flag (defaults to False). Accepts true/false as bool or string.
+        raw_transcribe = payload.get("transcribe", False)
+        if isinstance(raw_transcribe, str):
+            transcribe = raw_transcribe.lower() in ("true", "tru", "1", "yes", "on")
+        else:
+            transcribe = bool(raw_transcribe)
+        jobs[job_id]["transcribe"] = transcribe
+
         # Prefer contact_id over call_id; maintain call_id for backward compatibility
         contact_id = payload.get("contact_id")
         call_id = payload.get("call_id")
@@ -1099,12 +1104,55 @@ def process_job(job_id: str, payload: dict):
         jobs[job_id]["contact_id"] = contact_id
         jobs[job_id]["call_id"] = call_id
 
-        jobs[job_id]["status"] = "downloading"
         # Resolve and store customer slug early for downstream uses
         try:
             jobs[job_id]["customer_slug"] = resolve_customer_slug_from_payload(payload)  # optional
         except Exception:
             pass
+
+        # If transcription is disabled, just send webhook with metadata and finish
+        if not transcribe:
+            jobs[job_id]["status"] = "done"
+            jobs[job_id]["finished_at"] = time.time()
+
+            # Send GUI link to Make.com webhook if configured
+            try:
+                # Collect all outbound webhooks: env default, make.com, client-specific, and extras
+                webhook_urls = []
+                env_url = os.getenv("MAKE_WEBHOOK_URL")
+                if env_url:
+                    webhook_urls.append(env_url)
+                if payload.get("make_webhook_url"):
+                    webhook_urls.append(payload.get("make_webhook_url"))
+                if payload.get("client_webhook_url"):
+                    webhook_urls.append(payload.get("client_webhook_url"))
+                if isinstance(payload.get("extra_webhook_urls"), list):
+                    webhook_urls.extend([u for u in payload.get("extra_webhook_urls") if isinstance(u, str) and u])
+
+                # De-duplicate while preserving order
+                seen = set()
+                unique_urls = []
+                for u in webhook_urls:
+                    if u not in seen:
+                        seen.add(u)
+                        unique_urls.append(u)
+
+                for url in unique_urls:
+                    logger.info("Sending webhook (no transcription) to URL: %s", url)
+                    logger.info("Job data entity_id: %s", jobs[job_id].get("entity_id"))
+                    send_make_webhook_v3(jobs[job_id], contact_id, call_id, url, original_payload=payload, job_id=job_id)
+            except Exception as make_ex:
+                logger.warning("Unexpected error while posting to Make.com webhook (no transcription): %s", make_ex)
+
+            logger.info("Job %s completed without transcription (transcribe=false)", job_id)
+            return
+
+        # From here on, transcription is enabled
+        audio_url = payload.get("audio")
+        if not audio_url:
+            raise ValueError("payload must include 'audio' url when transcribe=true")
+
+        jobs[job_id]["status"] = "downloading"
         # build a readable persisted audio name and a temp download target
         # Add timestamp to ensure unique file names
         readable_name = derive_readable_audio_name(audio_url, f"{entity_id}_{uuid.uuid4().hex[:8]}.wav")
@@ -1408,7 +1456,7 @@ def webhook3_listener(payload: dict):
     logger.info("Inbound v3 payload keys: %s", list(payload.keys()))
     job_id = str(uuid.uuid4())
 
-    # V3: Pull from customData (token, slug, googlesheet, audio are "custom")
+    # V3: Pull from customData (token, slug, googlesheet, audio, transcribe are "custom")
     try:
         custom = payload.get("customData") if isinstance(payload, dict) else None
         if isinstance(custom, dict):
@@ -1416,12 +1464,10 @@ def webhook3_listener(payload: dict):
             payload.setdefault("token", custom.get("token"))
             payload.setdefault("slug", custom.get("slug"))
             payload.setdefault("googlesheet", custom.get("googlesheet"))
+            if "transcribe" not in payload and custom.get("transcribe") is not None:
+                payload["transcribe"] = custom.get("transcribe")
     except Exception:
         pass
-
-    # V3: Remove deprecated fields if present anywhere at top-level
-    payload.pop("date_time", None)
-    payload.pop("company_name", None)
 
     # V3: Derive caller_name from phoneCall.user.name if missing
     try:
@@ -1439,6 +1485,13 @@ def webhook3_listener(payload: dict):
     # Default language to en if missing
     if "language" not in payload:
         payload["language"] = "en"
+
+    # Default and normalize transcribe flag (defaults to False). Accepts true/false as bool or string.
+    raw_transcribe = payload.get("transcribe", False)
+    if isinstance(raw_transcribe, str):
+        payload["transcribe"] = raw_transcribe.lower() in ("true", "tru", "1", "yes", "on")
+    else:
+        payload["transcribe"] = bool(raw_transcribe)
 
     contact_id = payload.get("contact_id")
     call_id = payload.get("call_id")
