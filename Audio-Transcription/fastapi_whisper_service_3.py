@@ -528,9 +528,10 @@ def send_make_webhook_v3(job_data: dict, contact_id: Optional[str], call_id: Opt
     - Includes: phoneCall.* and contact.* fields if present
     """
     try:
-        url = webhook_url or os.getenv("MAKE_WEBHOOK_URL")
+        # Output webhook URL comes from input payload (customData.make_url_out), not from .env
+        url = webhook_url
         if not url:
-            logger.info("No Make.com webhook URL provided; skipping Make webhook post")
+            logger.info("No output webhook URL provided (expect customData.make_url_out); skipping Make webhook post")
             return False
 
         # Use entity_id for GUI link (with timestamp) to match S3 folder structure
@@ -557,7 +558,7 @@ def send_make_webhook_v3(job_data: dict, contact_id: Optional[str], call_id: Opt
         except Exception:
             custom = None
         if isinstance(custom, dict):
-            for field in ("audio", "token", "slug", "googlesheet", "transcribe"):
+            for field in ("audio", "token", "slug", "googlesheet", "transcribe", "make_url_out"):
                 if field not in payload and custom.get(field) is not None:
                     payload[field] = custom.get(field)
 
@@ -1115,32 +1116,15 @@ def process_job(job_id: str, payload: dict):
             jobs[job_id]["status"] = "done"
             jobs[job_id]["finished_at"] = time.time()
 
-            # Send GUI link to Make.com webhook if configured
+            # Send output to Make webhook URL from input payload (customData.make_url_out)
             try:
-                # Collect all outbound webhooks: env default, make.com, client-specific, and extras
-                webhook_urls = []
-                env_url = os.getenv("MAKE_WEBHOOK_URL")
-                if env_url:
-                    webhook_urls.append(env_url)
-                if payload.get("make_webhook_url"):
-                    webhook_urls.append(payload.get("make_webhook_url"))
-                if payload.get("client_webhook_url"):
-                    webhook_urls.append(payload.get("client_webhook_url"))
-                if isinstance(payload.get("extra_webhook_urls"), list):
-                    webhook_urls.extend([u for u in payload.get("extra_webhook_urls") if isinstance(u, str) and u])
-
-                # De-duplicate while preserving order
-                seen = set()
-                unique_urls = []
-                for u in webhook_urls:
-                    if u not in seen:
-                        seen.add(u)
-                        unique_urls.append(u)
-
-                for url in unique_urls:
-                    logger.info("Sending webhook (no transcription) to URL: %s", url)
+                out_url = (payload.get("make_url_out") or "").strip()
+                if out_url:
+                    logger.info("Sending webhook (no transcription) to URL: %s", out_url)
                     logger.info("Job data entity_id: %s", jobs[job_id].get("entity_id"))
-                    send_make_webhook_v3(jobs[job_id], contact_id, call_id, url, original_payload=payload, job_id=job_id)
+                    send_make_webhook_v3(jobs[job_id], contact_id, call_id, out_url, original_payload=payload, job_id=job_id)
+                else:
+                    logger.info("No make_url_out in payload; skipping output webhook (no transcription)")
             except Exception as make_ex:
                 logger.warning("Unexpected error while posting to Make.com webhook (no transcription): %s", make_ex)
 
@@ -1337,32 +1321,15 @@ def process_job(job_id: str, payload: dict):
             jobs[job_id]["prompt_s3_url"] = prompt_s3_url
             jobs[job_id]["prompt_s3_key"] = prompt_s3_key
 
-        # Send GUI link to Make.com webhook if configured
+        # Send output to Make webhook URL from input payload (customData.make_url_out); .env is not used
         try:
-            # Collect all outbound webhooks: env default, make.com, client-specific, and extras
-            webhook_urls = []
-            env_url = os.getenv("MAKE_WEBHOOK_URL")
-            if env_url:
-                webhook_urls.append(env_url)
-            if payload.get("make_webhook_url"):
-                webhook_urls.append(payload.get("make_webhook_url"))
-            if payload.get("client_webhook_url"):
-                webhook_urls.append(payload.get("client_webhook_url"))
-            if isinstance(payload.get("extra_webhook_urls"), list):
-                webhook_urls.extend([u for u in payload.get("extra_webhook_urls") if isinstance(u, str) and u])
-
-            # De-duplicate while preserving order
-            seen = set()
-            unique_urls = []
-            for u in webhook_urls:
-                if u not in seen:
-                    seen.add(u)
-                    unique_urls.append(u)
-
-            for url in unique_urls:
-                logger.info("Sending webhook to URL: %s", url)
+            out_url = (payload.get("make_url_out") or "").strip()
+            if out_url:
+                logger.info("Sending webhook to URL: %s", out_url)
                 logger.info("Job data entity_id: %s", jobs[job_id].get("entity_id"))
-                send_make_webhook_v3(jobs[job_id], contact_id, call_id, url, original_payload=payload, job_id=job_id)
+                send_make_webhook_v3(jobs[job_id], contact_id, call_id, out_url, original_payload=payload, job_id=job_id)
+            else:
+                logger.info("No make_url_out in payload; skipping output webhook")
         except Exception as make_ex:
             logger.warning("Unexpected error while posting to Make.com webhook: %s", make_ex)
 
@@ -1456,7 +1423,7 @@ def webhook3_listener(payload: dict):
     logger.info("Inbound v3 payload keys: %s", list(payload.keys()))
     job_id = str(uuid.uuid4())
 
-    # V3: Pull from customData (token, slug, googlesheet, audio, transcribe are "custom")
+    # V3: Pull from customData (token, slug, googlesheet, audio, transcribe, make_url_out are "custom")
     try:
         custom = payload.get("customData") if isinstance(payload, dict) else None
         if isinstance(custom, dict):
@@ -1466,6 +1433,8 @@ def webhook3_listener(payload: dict):
             payload.setdefault("googlesheet", custom.get("googlesheet"))
             if "transcribe" not in payload and custom.get("transcribe") is not None:
                 payload["transcribe"] = custom.get("transcribe")
+            if "make_url_out" not in payload and custom.get("make_url_out") is not None:
+                payload["make_url_out"] = custom.get("make_url_out")
     except Exception:
         pass
 
