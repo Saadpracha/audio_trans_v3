@@ -16,6 +16,15 @@ try:
 except Exception:
     ai_summary = None  # type: ignore
 
+# PyTorch 2.6+ defaults to weights_only=True in torch.load; pyannote VAD checkpoints
+# contain omegaconf.ListConfig. Allowlist it so subprocess/whisper_diarizer loads succeed.
+try:
+    import torch
+    from omegaconf import DictConfig, ListConfig
+    torch.serialization.add_safe_globals([DictConfig, ListConfig])
+except (ImportError, AttributeError):
+    pass
+
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
