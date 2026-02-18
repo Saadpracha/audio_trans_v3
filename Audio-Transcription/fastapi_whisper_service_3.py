@@ -582,6 +582,7 @@ def send_make_webhook_v3(job_data: dict, contact_id: Optional[str], call_id: Opt
             "created_at": int(time.time()),
             "job_id": job_id,
             "audio_length": job_data.get("audio_length"),  # formatted mm:ss string
+            "audio_duration_seconds": job_data.get("audio_duration_seconds"),  # raw seconds (when available)
         })
 
         # V3: Explicitly include phoneCall and contact objects if present
@@ -1120,24 +1121,68 @@ def process_job(job_id: str, payload: dict):
         except Exception:
             pass
 
-        # If transcription is disabled, just send webhook with metadata and finish
+        # If transcription is disabled: download audio, save to S3, send webhook with audio link + duration
         if not transcribe:
+            audio_url = payload.get("audio")
+            if not audio_url:
+                raise ValueError("payload must include 'audio' url to save and return audio link (transcribe=false)")
+
+            jobs[job_id]["status"] = "downloading"
+            readable_name = derive_readable_audio_name(audio_url, f"{entity_id}_{uuid.uuid4().hex[:8]}.wav")
+            temp_download_name = f"{entity_id}_{uuid.uuid4().hex[:8]}"
+            local_path = AUDIO_TMP_DIR / temp_download_name
+            audio_auth = None
+            if isinstance(payload.get("audio_auth"), dict):
+                aa = payload.get("audio_auth")
+                audio_auth = (aa.get("username"), aa.get("password"))
+            headers = payload.get("audio_headers")
+            local_path = download_audio(audio_url, local_path, auth=audio_auth, headers=headers)
+
+            # Probe audio duration
+            try:
+                audio_length_sec = probe_audio_duration_seconds(local_path)
+                if audio_length_sec is not None:
+                    jobs[job_id]["audio_length"] = format_seconds_mmss(audio_length_sec)
+                    jobs[job_id]["audio_duration_seconds"] = round(audio_length_sec, 2)
+                    logger.info("Probed audio duration: %s", jobs[job_id]["audio_length"])
+            except Exception as dur_ex:
+                logger.warning("Failed to probe audio duration: %s", dur_ex)
+
+            # Upload audio to S3 (as-is, no transcription)
+            jobs[job_id]["status"] = "uploading_to_s3"
+            customer_slug = jobs[job_id].get("customer_slug")
+            if customer_slug:
+                s3_base_key = f"audio/{customer_slug}/{entity_id}/"
+            else:
+                s3_base_key = f"audio/{entity_id}/"
+            audio_s3_key = f"{s3_base_key}{readable_name}"
+            audio_s3_url = upload_to_s3(local_path, audio_s3_key)
+            jobs[job_id]["audio_s3_url"] = audio_s3_url
+            jobs[job_id]["audio_s3_key"] = audio_s3_key
+            jobs[job_id]["s3_base_key"] = s3_base_key
+
+            # Clean up temp file
+            try:
+                if local_path and local_path.exists():
+                    local_path.unlink(missing_ok=True)
+            except Exception as cleanup_ex:
+                logger.warning("Failed to remove temp audio: %s", cleanup_ex)
+
             jobs[job_id]["status"] = "done"
             jobs[job_id]["finished_at"] = time.time()
 
-            # Send output to Make webhook URL from input payload (customData.make_url_out)
+            # Send webhook with audio link and duration
             try:
                 out_url = (payload.get("make_url_out") or "").strip()
                 if out_url:
-                    logger.info("Sending webhook (no transcription) to URL: %s", out_url)
-                    logger.info("Job data entity_id: %s", jobs[job_id].get("entity_id"))
+                    logger.info("Sending webhook (no transcription, with audio link + duration) to URL: %s", out_url)
                     send_make_webhook_v3(jobs[job_id], contact_id, call_id, out_url, original_payload=payload, job_id=job_id)
                 else:
                     logger.info("No make_url_out in payload; skipping output webhook (no transcription)")
             except Exception as make_ex:
                 logger.warning("Unexpected error while posting to Make.com webhook (no transcription): %s", make_ex)
 
-            logger.info("Job %s completed without transcription (transcribe=false)", job_id)
+            logger.info("Job %s completed without transcription (transcribe=false): audio saved to S3", job_id)
             return
 
         # From here on, transcription is enabled
@@ -1160,11 +1205,11 @@ def process_job(job_id: str, payload: dict):
         local_path = download_audio(audio_url, local_path, auth=audio_auth, headers=headers)
         # Probe audio duration
         try:
-            audio_length = probe_audio_duration_seconds(local_path)
-            if audio_length is not None:
-                formatted_length = format_seconds_mmss(audio_length)
-                jobs[job_id]["audio_length"] = formatted_length
-                logger.info("Probed audio duration (mm:ss): %s", formatted_length)
+            audio_length_sec = probe_audio_duration_seconds(local_path)
+            if audio_length_sec is not None:
+                jobs[job_id]["audio_length"] = format_seconds_mmss(audio_length_sec)
+                jobs[job_id]["audio_duration_seconds"] = round(audio_length_sec, 2)
+                logger.info("Probed audio duration (mm:ss): %s", jobs[job_id]["audio_length"])
         except Exception as dur_ex:
             logger.warning("Failed to probe audio duration: %s", dur_ex)
 
